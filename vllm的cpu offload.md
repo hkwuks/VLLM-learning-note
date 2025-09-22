@@ -6,7 +6,7 @@ vllm也实现了一个简单的CPU Offload机制，可以通过`--cpu-offload-gb
 
 > 官方文档：https://docs.vllm.ai/en/latest/getting_started/examples/basic.html#cpu-offload
 
-主要是通过这个[PR](https://github.com/vllm-project/vllm/pull/6496)，添加了一个func叫`maybe_offload_to_cpu`：
+主要是通过这个[PR](https://github.com/vllm-project/vllm/pull/6496)，添加了一个function叫`maybe_offload_to_cpu`：
 
 - [model_executor/models/utils.py#L487-L540](https://github.com/vllm-project/vllm/blob/82fbeae92b86e404829a01441334a9505e8b190d/vllm/model_executor/models/utils.py#L487-L540)
 
@@ -23,8 +23,9 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
         return module
 
-    # 对于CPU来说，不支持pin_memory，在CpuPlatform类中明确返回False
-    # 这里应该是在判断GPU是否支持pin_memory，以便使用torch的pin_memory
+    # 对于CPU来说，在CpuPlatform类中明确返回False
+    # 但是在torch.empty_strided()接口中明确pin_memory只在CPU上受支持
+    # 所以这里需要后续去深入看一下
     pin_memory = is_pin_memory_available()
 
     # offload parameters to CPU
@@ -74,3 +75,21 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
 
 这个函数只有一个地方调用：
 
+- [model_executor/models/utils.py#L556-L560](https://github.com/vllm-project/vllm/blob/82fbeae92b86e404829a01441334a9505e8b190d/vllm/model_executor/models/utils.py#L556-L560)
+
+```python
+modules = torch.nn.ModuleList(
+    [PPMissingLayer() for _ in range(start_layer)] + [
+        maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+        for idx in range(start_layer, end_layer)] + [
+        PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
+)
+```
+
+CPU Offload的流程可以概括为：
+
+1. 将传入的`cpu_offload_gb`读取为`_CPU_OFFLOAD_MAX_BYTES`。
+1. 然后在构建Module时对每个Layer里面的参数从前往后依次塞到CPU的pin_memory上，并累加参数大小，直到超过用户配置的大小。
+1. 替换对应Module的`forward`函数，新的forward函数增加的功能就是每次forward的时候将CPU上的参数复制到GPU上，计算完毕后释放
+
+值得学习的是：这里的替换逻辑非常的高超，通过临时替换forward函数配合`functional_call`函数，巧妙的解决了原始forward函数调用的问题。
